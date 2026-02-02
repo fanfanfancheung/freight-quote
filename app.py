@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-货代报价查询系统 - 网页版
+货代报价查询系统 - 网页版 v2
 作者: 强子 (OpenClaw)
+更新: 2026-02-02 - 修复时效列按区域选择的问题
 """
 
 import streamlit as st
@@ -19,7 +20,7 @@ SKIP_SHEETS = ["首推王牌渠道", "目录", "新增网点报价栏", "附加�
 REGION_MAPPING = {
     "华南": "华南", "深圳": "华南", "广州": "华南",
     "华东": "华东", "上海": "华东", "江苏": "华东", 
-    "苏州": "华东", "宁波": "华东", "浙江": "华东",
+    "苏州": "华东", "宁波": "华东", "浙江": "华东", "杭州": "华东",
     "青岛": "青岛", "山东": "青岛",
     "福建": "福建", "厦门": "福建", "福州": "福州",
     "天津": "天津", "北京": "天津",
@@ -32,50 +33,89 @@ REGIONS = ["华东", "华南", "青岛", "福建", "天津"]
 # ============================================================
 
 def find_region_columns(df: pd.DataFrame, target_region: str) -> Dict:
-    """分析Sheet结构，找出目标区域的含税和自税列位置"""
+    """
+    分析Sheet结构，找出目标区域的含税、自税、时效列位置
+    
+    v2修复: 时效列现在根据区域正确选择，而不是取全局第一个
+    """
     result = {
         'region_row': None,
         'tax_included_col': None,
         'tax_excluded_col': None,
         'time_col': None,
+        'dw_time_col': None,
         'data_start_row': 6
     }
     
-    for row_idx in range(3, 8):
-        if row_idx >= len(df):
-            continue
-        row_str = ' '.join([str(x) for x in df.iloc[row_idx] if pd.notna(x)])
-        if '华东' in row_str or '华南' in row_str or '区域' in row_str:
-            result['region_row'] = row_idx
-            break
+    # 标题行和区域行
+    header_row = 3
+    region_row = 4
     
-    if result['region_row'] is None:
+    if region_row >= len(df):
         return result
     
-    region_row = result['region_row']
-    tax_row = region_row - 1
+    result['region_row'] = region_row
     
+    # 遍历列，找目标区域的所有相关列
     for col_idx in range(len(df.columns)):
-        cell_val = df.iloc[region_row, col_idx]
-        if pd.isna(cell_val):
+        region_cell = df.iloc[region_row, col_idx]
+        
+        if pd.isna(region_cell):
             continue
         
-        cell_str = str(cell_val)
+        region_str = str(region_cell)
         
-        if target_region in cell_str or (target_region == "华东" and "华东" in cell_str):
-            tax_marker = str(df.iloc[tax_row, col_idx]) if tax_row >= 0 else ""
+        # 检查是否匹配目标区域
+        region_matched = False
+        if target_region == "华东":
+            region_matched = "华东" in region_str or "上海" in region_str or "宁波" in region_str or "苏州" in region_str
+        elif target_region == "华南":
+            region_matched = region_str == "华南" or (target_region in region_str and "华东" not in region_str)
+        else:
+            region_matched = target_region in region_str
+        
+        if region_matched:
+            # 检查这一列的标题（第3行）来确定是什么类型的列
+            header_cell = df.iloc[header_row, col_idx] if header_row < len(df) else None
+            header_str = str(header_cell) if pd.notna(header_cell) else ""
             
-            if "含税" in tax_marker and result['tax_included_col'] is None:
-                result['tax_included_col'] = col_idx
-            elif "自税" in tax_marker and result['tax_excluded_col'] is None:
-                result['tax_excluded_col'] = col_idx
+            # 检查第5行的标记（KG+ 或 CBM+）
+            unit_cell = df.iloc[5, col_idx] if 5 < len(df) else None
+            unit_str = str(unit_cell) if pd.notna(unit_cell) else ""
+            
+            # 判断列类型
+            if "含税" in header_str:
+                if "KG" in unit_str and result['tax_included_col'] is None:
+                    result['tax_included_col'] = col_idx
+            elif "自税" in header_str:
+                if "CBM" in unit_str and result['tax_excluded_col'] is None:
+                    result['tax_excluded_col'] = col_idx
     
-    for col_idx in range(len(df.columns)):
-        header_val = df.iloc[3, col_idx] if 3 < len(df) else None
-        if pd.notna(header_val) and "时效" in str(header_val):
-            result['time_col'] = col_idx
-            break
+    # 关键修复：时效列必须在价格列的【后面】
+    if result['tax_included_col'] is not None or result['tax_excluded_col'] is not None:
+        price_col_ref = result['tax_included_col'] or result['tax_excluded_col']
+        
+        # 时效列在价格列后面1-3列的范围内查找
+        for offset in [2, 1, 3]:
+            check_col = price_col_ref + offset
+            if check_col < len(df.columns):
+                header_cell = df.iloc[header_row, check_col]
+                header_str = str(header_cell) if pd.notna(header_cell) else ""
+                
+                if "全程时效" in header_str and result['time_col'] is None:
+                    result['time_col'] = check_col
+                elif "DW" in header_str and result['dw_time_col'] is None:
+                    result['dw_time_col'] = check_col
+        
+        # DW送达通常在全程时效后面一列
+        if result['time_col'] is not None and result['dw_time_col'] is None:
+            dw_col = result['time_col'] + 1
+            if dw_col < len(df.columns):
+                header_cell = df.iloc[header_row, dw_col]
+                if pd.notna(header_cell) and "DW" in str(header_cell):
+                    result['dw_time_col'] = dw_col
     
+    # 查找数据起始行
     for row_idx in range(5, 10):
         if row_idx >= len(df):
             continue
@@ -92,7 +132,7 @@ def find_region_columns(df: pd.DataFrame, target_region: str) -> Dict:
 def query_prices(df_dict: dict, warehouse_code: str, region: str, tax_type: str) -> List[Dict]:
     """查询指定仓库在所有渠道的价格"""
     normalized_region = REGION_MAPPING.get(region, region)
-    if "华东" in normalized_region or region in ["上海", "江苏", "苏州", "宁波", "浙江"]:
+    if "华东" in normalized_region or region in ["上海", "江苏", "苏州", "宁波", "浙江", "杭州"]:
         normalized_region = "华东"
     
     results = []
@@ -116,6 +156,7 @@ def query_prices(df_dict: dict, warehouse_code: str, region: str, tax_type: str)
                 continue
             
             time_col = structure['time_col']
+            dw_time_col = structure['dw_time_col']
             data_start = structure['data_start_row']
             
             for row_idx in range(data_start, len(df)):
@@ -130,15 +171,23 @@ def query_prices(df_dict: dict, warehouse_code: str, region: str, tax_type: str)
                 if warehouse_str == target_code or target_code in warehouse_str:
                     price = df.iloc[row_idx, price_col]
                     time_val = df.iloc[row_idx, time_col] if time_col else None
+                    dw_time_val = df.iloc[row_idx, dw_time_col] if dw_time_col else None
                     
                     channel = df.iloc[row_idx, 1]
                     if pd.isna(channel):
                         channel = sheet_name
                     
+                    # 组合时效显示
+                    time_display = str(time_val) if pd.notna(time_val) else '-'
+                    if pd.notna(dw_time_val):
+                        time_display += f" (DW: {dw_time_val})"
+                    
                     results.append({
                         '渠道': str(channel) if pd.notna(channel) else sheet_name,
                         '渠道分类': sheet_name,
-                        '时效': str(time_val) if pd.notna(time_val) else '-',
+                        '时效': time_display,
+                        '全程时效': str(time_val) if pd.notna(time_val) else '-',
+                        'DW送达': str(dw_time_val) if pd.notna(dw_time_val) else '-',
                         '价格': price if pd.notna(price) else '-',
                         '仓库': warehouse_str,
                         '区域': normalized_region,
@@ -202,7 +251,6 @@ default_file = "data/报价表.xlsx"
 has_default = os.path.exists(default_file)
 
 if uploaded_file is not None:
-    # 使用上传的文件
     @st.cache_data
     def load_excel(file):
         return pd.read_excel(file, sheet_name=None, header=None)
@@ -212,7 +260,6 @@ if uploaded_file is not None:
     st.success(f"✅ 已加载: {uploaded_file.name}")
 
 elif has_default:
-    # 使用默认文件
     @st.cache_data
     def load_default():
         return pd.read_excel(default_file, sheet_name=None, header=None)
@@ -232,7 +279,6 @@ warehouses = get_all_warehouses(df_dict)
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    # 支持输入或选择
     warehouse_input = st.text_input("🏭 仓库代码", placeholder="输入如 ONT8, BOS7...")
     if not warehouse_input and warehouses:
         warehouse_input = st.selectbox("或选择仓库", [""] + warehouses)
@@ -259,10 +305,10 @@ if st.button("🔍 查询价格", type="primary", use_container_width=True):
             # 显示最优推荐
             best = results[0]
             if best['价格'] != '-':
-                st.success(f"💡 **推荐:** {best['渠道']} — 价格 ¥{best['价格']}/kg, 时效 {best['时效']}")
+                st.success(f"💡 **推荐:** {best['渠道']} — 价格 ¥{best['价格']}/kg, 时效 {best['全程时效']}")
             
-            # 显示完整表格
-            df_result = pd.DataFrame(results)[['渠道', '时效', '价格', '渠道分类']]
+            # 显示完整表格（新增DW送达列）
+            df_result = pd.DataFrame(results)[['渠道', '全程时效', 'DW送达', '价格', '渠道分类']]
             df_result.index = range(1, len(df_result) + 1)
             st.dataframe(df_result, use_container_width=True)
             
@@ -279,4 +325,4 @@ if st.button("🔍 查询价格", type="primary", use_container_width=True):
 
 # 页脚
 st.markdown("---")
-st.caption("Made with ❤️ by 强子 (OpenClaw) | 如需更新报价表，直接上传新文件即可")
+st.caption("Made with ❤️ by 强子 (OpenClaw) | v2.0 - 修复时效按区域显示 | 如需更新报价表，直接上传新文件即可")
