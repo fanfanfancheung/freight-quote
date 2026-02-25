@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-货代报价查询系统 - 网页版 v3
+货代报价查询系统 - 网页版 v4.0
 作者: 强子 (OpenClaw)
-更新: 2026-02-03
+更新: 2026-02-25
 
-v3修复:
-    1) 同一Sheet内多行匹配不再漏掉
-    2) 时效列优先找全局时效，解决显示"-"的问题
+v4修复: 时效/DW列按区域+税种精准匹配（从价格列向右找最近的时效列）
 """
 
 import streamlit as st
 import pandas as pd
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # ============================================================
 # 配置
@@ -36,41 +34,35 @@ REGIONS = ["华东", "华南", "青岛", "福建", "福州", "天津"]
 # 核心查询函数 v3
 # ============================================================
 
-def find_time_columns(df: pd.DataFrame) -> Dict:
+def find_region_columns(df: pd.DataFrame, target_region: str, tax_type: str) -> Dict:
     """
-    查找全局时效列（不分区域的）
-    """
-    result = {'global_time_col': None, 'global_dw_col': None}
+    找到目标区域+税种的价格列，以及该价格列对应的时效/DW列。
     
-    header_row = 3
-    if header_row >= len(df):
-        return result
-    
-    for col_idx in range(len(df.columns)):
-        header_cell = df.iloc[header_row, col_idx]
-        if pd.isna(header_cell):
-            continue
-        header_str = str(header_cell)
-        
-        if "全程时效" in header_str and result['global_time_col'] is None:
-            result['global_time_col'] = col_idx
-        elif "DW" in header_str and "送达" in header_str and result['global_dw_col'] is None:
-            result['global_dw_col'] = col_idx
-    
-    return result
-
-
-def find_region_price_column(df: pd.DataFrame, target_region: str, tax_type: str) -> Optional[int]:
+    核心逻辑：先定位价格列，再从价格列向右扫描找到最近的时效/DW列。
+    这样无论是"区域分组"（每个区域有自己的时效列）还是"税种分组"
+    （所有区域共用末尾时效列）布局都能正确匹配。
     """
-    找到目标区域的价格列
-    """
+    result = {'price_col': None, 'time_col': None, 'dw_col': None}
+    
     header_row = 3
     region_row = 4
     unit_row = 5
     
     if region_row >= len(df) or header_row >= len(df):
-        return None
+        return result
     
+    # 第一步：收集所有时效列和DW列位置
+    all_time_cols = []
+    all_dw_cols = []
+    for col_idx in range(len(df.columns)):
+        header_cell = df.iloc[header_row, col_idx]
+        header_str = str(header_cell) if pd.notna(header_cell) else ""
+        if "时效" in header_str and "理赔" not in header_str:
+            all_time_cols.append(col_idx)
+        elif "DW" in header_str:
+            all_dw_cols.append(col_idx)
+    
+    # 第二步：找目标区域+税种的价格列
     target_unit = "KG" if tax_type == "含税" else "CBM"
     
     for col_idx in range(len(df.columns)):
@@ -100,33 +92,22 @@ def find_region_price_column(df: pd.DataFrame, target_region: str, tax_type: str
         unit_str = str(unit_cell) if pd.notna(unit_cell) else ""
         
         if target_unit in unit_str:
-            return col_idx
-    
-    return None
-
-
-def find_region_time_columns(df: pd.DataFrame, price_col: int) -> Dict:
-    """
-    在价格列附近找时效列
-    """
-    result = {'time_col': None, 'dw_col': None}
-    header_row = 3
-    
-    if price_col is None or header_row >= len(df):
-        return result
-    
-    for offset in range(1, 5):
-        check_col = price_col + offset
-        if check_col >= len(df.columns):
+            result['price_col'] = col_idx
             break
+    
+    # 第三步：从价格列向右找最近的时效/DW列
+    if result['price_col'] is not None:
+        price_col = result['price_col']
         
-        header_cell = df.iloc[header_row, check_col]
-        header_str = str(header_cell) if pd.notna(header_cell) else ""
+        for tc in all_time_cols:
+            if tc > price_col:
+                result['time_col'] = tc
+                break
         
-        if "全程时效" in header_str and result['time_col'] is None:
-            result['time_col'] = check_col
-        elif "DW" in header_str and result['dw_col'] is None:
-            result['dw_col'] = check_col
+        for dc in all_dw_cols:
+            if dc > price_col:
+                result['dw_col'] = dc
+                break
     
     return result
 
@@ -148,20 +129,14 @@ def query_prices(df_dict: dict, warehouse_code: str, region: str, tax_type: str)
             continue
         
         try:
-            # 找全局时效列
-            global_time = find_time_columns(df)
-            
-            # 找区域价格列
-            price_col = find_region_price_column(df, normalized_region, tax_type)
+            # 找区域+税种对应的价格列和时效列
+            cols = find_region_columns(df, normalized_region, tax_type)
+            price_col = cols['price_col']
             if price_col is None:
                 continue
             
-            # 找区域时效列
-            region_time = find_region_time_columns(df, price_col)
-            
-            # 确定使用哪个时效列：优先全局，其次区域
-            time_col = global_time['global_time_col'] or region_time['time_col']
-            dw_col = global_time['global_dw_col'] or region_time['dw_col']
+            time_col = cols['time_col']
+            dw_col = cols['dw_col']
             
             data_start = 6
             
@@ -241,7 +216,7 @@ st.set_page_config(
 )
 
 st.title("📦 货代报价查询系统")
-st.caption("v3 - 修复多渠道匹配和时效显示")
+st.caption("v4.0 - 时效/DW按区域+税种精准匹配")
 st.markdown("---")
 
 # 上传文件或使用默认文件
@@ -318,4 +293,4 @@ if st.button("🔍 查询价格", type="primary", use_container_width=True):
             st.warning(f"❌ 未找到 {warehouse_input} 在 {region} 区域的报价")
 
 st.markdown("---")
-st.caption("Made with ❤️ by 强子 (OpenClaw) | v3 修复版")
+st.caption("Made with ❤️ by 强子 (OpenClaw) | v4.0 - 时效/DW按区域+税种精准匹配")
